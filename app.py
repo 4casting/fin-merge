@@ -4,674 +4,621 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 from fpdf import FPDF
-from sklearn.linear_model import LinearRegression
-from sklearn.preprocessing import StandardScaler
 import io
-import math
 import datetime
 import tempfile
 
 # ==========================================
-# 0. KONFIGURATION & HELPER
+# 0. SETUP & HELPER
 # ==========================================
-st.set_page_config(page_title="Integrated Real Option & Financial Model", layout="wide")
+st.set_page_config(page_title="Master Integrated Valuation", layout="wide", initial_sidebar_state="expanded")
 
-if 'history' not in st.session_state: st.session_state.history = []
 if 'sim_results' not in st.session_state: st.session_state.sim_results = None
 
-def safe_float(value, default=0.0):
-    try:
-        if value is None or (isinstance(value, str) and not value.strip()) or pd.isna(value): 
-            return default
-        return float(value)
-    except: 
-        return default
+def safe_float(val):
+    try: return float(val)
+    except: return 0.0
 
-# Initialisierung der detaillierten Kostendaten (aus Modell 2)
-if "current_jobs_df" not in st.session_state:
-    roles = [
-        {"Job Titel": "CEO", "Jahresgehalt (€)": 120000, "FTE Jahr 1": 1.0, "Laptop": True, "Smartphone": True, "Auto": True, "Büro": True},
-        {"Job Titel": "Sales", "Jahresgehalt (€)": 60000, "FTE Jahr 1": 2.0, "Laptop": True, "Smartphone": True, "Auto": True, "Büro": True},
-        {"Job Titel": "Tech", "Jahresgehalt (€)": 65000, "FTE Jahr 1": 3.0, "Laptop": True, "Smartphone": False, "Auto": False, "Büro": True},
-    ]
-    st.session_state["current_jobs_df"] = pd.DataFrame(roles)
-
-if "cost_centers_df" not in st.session_state:
-    st.session_state["cost_centers_df"] = pd.DataFrame([
-        {"Kostenstelle": "Server & IT", "Grundwert Jahr 1 (€)": 12000, "Umsatz-Kopplung (%)": 2.0},
-        {"Kostenstelle": "Marketing (Fix)", "Grundwert Jahr 1 (€)": 50000, "Umsatz-Kopplung (%)": 0.0},
-        {"Kostenstelle": "Logistik/Ops", "Grundwert Jahr 1 (€)": 5000, "Umsatz-Kopplung (%)": 5.0},
+# Initialisierung der Finanz-Daten (aus Modell 2)
+if "staff_df" not in st.session_state:
+    st.session_state["staff_df"] = pd.DataFrame([
+        {"Rolle": "Management", "Gehalt (€)": 120000, "FTE Jahr 1": 1.0, "Steigerung/Umsatz": 0.0, "Laptop": True, "Auto": True},
+        {"Rolle": "Sales", "Gehalt (€)": 60000, "FTE Jahr 1": 2.0, "Steigerung/Umsatz": 0.00005, "Laptop": True, "Auto": True},
+        {"Rolle": "Tech/Support", "Gehalt (€)": 55000, "FTE Jahr 1": 3.0, "Steigerung/Umsatz": 0.00002, "Laptop": True, "Auto": False},
+        {"Rolle": "Admin", "Gehalt (€)": 45000, "FTE Jahr 1": 1.0, "Steigerung/Umsatz": 0.00001, "Laptop": False, "Auto": False},
     ])
 
-if "assets_params" not in st.session_state:
-    st.session_state["assets_params"] = {
-        "price_laptop": 1500, "ul_laptop": 3,
-        "price_phone": 800, "ul_phone": 2,
-        "price_car": 40000, "ul_car": 6,
-        "price_desk": 1000, "ul_desk": 10,
-        "capex_annual": 5000, "depreciation_misc": 5
+if "cost_df" not in st.session_state:
+    st.session_state["cost_df"] = pd.DataFrame([
+        {"Kostenstelle": "Büromiete", "Fix (€/Jahr)": 24000, "Variabel (% v. Umsatz)": 0.0},
+        {"Kostenstelle": "Server/IT", "Fix (€/Jahr)": 5000, "Variabel (% v. Umsatz)": 2.0},
+        {"Kostenstelle": "Marketing", "Fix (€/Jahr)": 50000, "Variabel (% v. Umsatz)": 5.0},
+        {"Kostenstelle": "Beratung/Legal", "Fix (€/Jahr)": 10000, "Variabel (% v. Umsatz)": 0.0},
+    ])
+
+if "params_fin" not in st.session_state:
+    st.session_state["params_fin"] = {
+        "equity": 200000.0, "loan": 0.0, "loan_rate": 5.0, "tax": 25.0,
+        "wage_inc": 2.5, "inflation": 2.0, "lnk": 25.0, # Lohnnebenkosten
+        "dso": 30, "dpo": 30, "min_cash": 10000.0
     }
 
-if "fin_params" not in st.session_state:
-    st.session_state["fin_params"] = {
-        "equity": 250000.0, "loan_initial": 0.0, "loan_rate": 5.0,
-        "tax_rate": 25.0, "wage_inc": 2.5, "inflation": 2.0, "lnk_pct": 25.0,
-        "cac": 150.0, "target_rev_per_fte": 150000.0, "min_cash": 20000.0
+if "params_asset" not in st.session_state:
+    st.session_state["params_asset"] = {
+        "p_laptop": 1500, "ul_laptop": 3,
+        "p_auto": 40000, "ul_auto": 6,
+        "capex_misc": 5000, "ul_misc": 5
     }
 
 # ==========================================
-# 1. KERN-LOGIK: SIMULATION (MODEL 1)
+# 1. LOGIK: FINANZ-ENGINE (Detailliert)
 # ==========================================
-def run_simulation(M, p, q, C, ARPU, kappa, Delta_CM, Fixed_Cost, start, T, 
-                   mode='static', trigger_val=0.05, fallback_params=None,
-                   check_mode='continuous', check_year=3, growth_metric='share_of_m',
-                   switch_config=None):
-    
-    # Arrays für Zeitreihen
-    N = np.zeros(T); W = np.zeros(T)
-    ARPU_series = np.zeros(T) # Speichern des effektiv realisierten ARPU
-    
-    N[0] = start
-    # Initial W (vereinfacht für Simulation, wird später detailliert berechnet)
-    W[0] = N[0] * ARPU - Fixed_Cost 
-    ARPU_series[0] = ARPU
-
-    option_exercised = False
-    project_is_dead = False
-    
-    curr_p, curr_q, curr_C = p, q, C
-    curr_ARPU, curr_kappa, curr_Delta_CM = ARPU, kappa, Delta_CM
-    curr_FC, curr_M = Fixed_Cost, M
-
-    growth_history = []
-
-    for t in range(1, T):
-        if project_is_dead:
-            N[t] = 0.0; W[t] = 0.0; ARPU_series[t] = 0.0
-            continue 
-
-        N_prev = N[t-1]
-        
-        # --- PROGNOSE ---
-        potential_acquisition = (curr_p + curr_q * (N_prev / curr_M)) * (curr_M - N_prev)
-        if potential_acquisition < 0: potential_acquisition = 0
-        
-        if growth_metric == 'share_of_m':
-            current_rate = potential_acquisition / curr_M
-        else:
-            current_rate = (potential_acquisition / N_prev) if N_prev > 0 else 0.0
-
-        # --- TRIGGER PRÜFUNG ---
-        if mode != 'static' and not option_exercised:
-            is_check_time = False
-            if check_mode == 'specific' and t == check_year: is_check_time = True
-            elif check_mode == 'continuous' and t >= check_year: is_check_time = True
-            
-            if is_check_time:
-                all_rates = growth_history + [current_rate]
-                avg_growth = sum(all_rates) / len(all_rates) if all_rates else 0
-                
-                if avg_growth < trigger_val:
-                    option_exercised = True
-                    
-                    if mode == 'switch' and fallback_params and switch_config:
-                        # Logik für Switch (Parameter ändern)
-                        target_ARPU = fallback_params['ARPU']
-                        delta_p = (target_ARPU - curr_ARPU) / curr_ARPU if curr_ARPU > 0 else 0.0
-                        
-                        if delta_p <= switch_config['thresh_low']: zone_prefix = 'zone1'
-                        elif delta_p <= switch_config['thresh_high']: zone_prefix = 'zone2'
-                        else: zone_prefix = 'zone3'
-                        
-                        use_gf = switch_config['grandfathering']
-                        suffix = "_gf" if use_gf else "_nogf"
-                        
-                        shock_factor = switch_config[f'shock_{zone_prefix}{suffix}']
-                        q_multiplier = switch_config[f'q_mult_{zone_prefix}{suffix}']
-                        
-                        # Parameter Update
-                        curr_p = fallback_params['p']
-                        curr_C = fallback_params['C']
-                        curr_ARPU = fallback_params['ARPU'] # Neuer Preis
-                        curr_kappa = fallback_params['kappa']
-                        curr_Delta_CM = fallback_params['Delta_CM']
-                        curr_FC = fallback_params['Fixed_Cost']
-                        
-                        base_target_q = fallback_params['q']
-                        curr_q = base_target_q * q_multiplier 
-                        
-                        # Churn Schock auf Bestand
-                        N_prev = N_prev * (1.0 - shock_factor)
-                        if N_prev < 0: N_prev = 0
-                        
-                        # Neue Akquise Basis berechnen nach Schock
-                        potential_acquisition = (curr_p + curr_q * (N_prev / curr_M)) * (curr_M - N_prev)
-                        if potential_acquisition < 0: potential_acquisition = 0
-                        
-                    elif mode == 'abandon':
-                        project_is_dead = True
-                        N[t] = 0.0; W[t] = 0.0; ARPU_series[t] = 0.0
-                        continue
-
-        # Tracking für Trigger Historie
-        realized_rate = 0
-        if growth_metric == 'share_of_m':
-            realized_rate = potential_acquisition / curr_M
-        else:
-            realized_rate = (potential_acquisition / N_prev) if N_prev > 0 else 0.0
-        growth_history.append(realized_rate)
-
-        # Kundenbestand Update
-        retention = N_prev * (1 - curr_C)
-        N[t] = retention + potential_acquisition
-        if N[t] > curr_M: N[t] = curr_M
-        
-        # Finanzwert (Vereinfacht für MC, dient nur als Proxy für Value)
-        revenue = N[t] * curr_ARPU
-        cannib = potential_acquisition * curr_kappa * curr_Delta_CM
-        W[t] = revenue - cannib - curr_FC
-        
-        ARPU_series[t] = curr_ARPU
-        
-    return N, W, sum(W), option_exercised, ARPU_series
-
-# ==========================================
-# 2. KERN-LOGIK: FINANZ-DETAILLIERUNG (MODEL 2)
-# ==========================================
-def calculate_detailed_financials(years_T, N_curve, ARPU_curve, jobs_df, cc_df, asset_conf, fin_conf):
+def calculate_financial_plan(T_years, N_series, ARPU_series, staff_df, cost_df, fin_par, asset_par):
     """
-    Nimmt die simulierten Kurven (N, ARPU) und berechnet den vollen Finanzplan.
+    Erstellt den detaillierten Finanzplan basierend auf einer exakten Kunden- und Preiskurve.
     """
-    results = []
+    # Vorbereitung
+    rows = []
     
-    # State Variablen
-    debt = fin_conf["loan_initial"]
-    cash = fin_conf["equity"]
-    retained = 0.0
-    fixed_assets = 0.0
-    loss_carry = 0.0
+    # State Vars
+    cash = fin_par["equity"]
+    debt = fin_par["loan"]
+    retained_earnings = 0.0
+    fixed_assets_net = 0.0
+    loss_carryforward = 0.0
     
-    # Assets Register
-    asset_reg = {"Laptop":[], "Smartphone":[], "Auto":[], "Büro":[], "Misc":[]}
-    mapping = {
-        "Laptop": ("price_laptop", "ul_laptop"), "Smartphone": ("price_phone", "ul_phone"),
-        "Auto": ("price_car", "ul_car"), "Büro": ("price_desk", "ul_desk")
-    }
+    # Asset Register (Liste von Dicts: {'year_bought': t, 'value': v, 'ul': 3})
+    asset_registry = [] 
     
-    prev_cc = {}
-    jobs = jobs_df.to_dict('records')
-    ccs = cc_df.to_dict('records')
+    # Datenaufbereitung
+    staff = staff_df.to_dict('records')
+    ccs = cost_df.to_dict('records')
     
-    # Loop über Jahre (Simulation Start ist t=0, Finanzen meist t=1..T)
-    # N_curve hat Länge T (z.B. 30). Wir nehmen die Jahre 1 bis T.
+    # Simulation Loop (Jahre 1 bis T)
+    # Achtung: N_series startet oft bei t=0. Wir mappen Simulation t auf Geschäftsjahr t+1
     
-    # Initial Setup t=0 (nicht im Result, nur Startwerte)
+    limit = min(len(N_series), T_years + 1)
     
-    for t_idx in range(1, len(N_curve)):
-        t = t_idx # Jahr 1, 2, 3...
+    for t in range(1, limit):
         row = {"Jahr": t}
         
-        # 1. Umsatz & Kunden (aus Simulation übernommen)
-        n_t = N_curve[t_idx]
-        arpu_t = ARPU_curve[t_idx]
+        # --- A. UMSATZ (Aus Simulation) ---
+        n_curr = N_series[t]
+        arpu_curr = ARPU_series[t]
         
-        if n_t <= 0:
-            # Abandon Fall oder Simulation Ende
-            results.append({k: 0 for k in ["Umsatz", "EBITDA", "Jahresüberschuss", "Kasse", "FTE Total"]})
-            results[-1]["Jahr"] = t
+        if n_curr <= 0: # Abandoned
+            rows.append({k:0 for k in ["Umsatz", "EBITDA", "Jahresüberschuss", "Kasse"]})
+            rows[-1]["Jahr"] = t
             continue
 
-        rev = n_t * arpu_t
-        row["Kunden"] = n_t
-        row["Umsatz"] = rev
+        revenue = n_curr * arpu_curr
+        row["Kunden"] = n_curr
+        row["ARPU"] = arpu_curr
+        row["Umsatz"] = revenue
         
-        prev_rev = results[-1]["Umsatz"] if len(results) > 0 else rev
-        growth = (rev - prev_rev)/prev_rev if len(results) > 0 and prev_rev > 0 else 0.0
-
-        # 2. Kosten (COGS Annahme: Pauschal 20% oder aus Delta_CM ableitbar, hier vereinfacht)
-        # In Modell 1 war Delta_CM der Margenverlust. Wir nehmen an COGS ~ 15% vom Umsatz
-        cogs = rev * 0.15 
-        row["Wareneinsatz (COGS)"] = cogs
+        # --- B. KOSTEN ---
+        # 1. COGS (Vereinfacht: Wir nehmen an, Delta Margin aus Sim ist Deckungsbeitrag. 
+        # Hier nehmen wir pauschal an, dass COGS ca 20% sind, falls nicht anders definiert)
+        cogs = revenue * 0.15 
+        row["COGS"] = cogs
         
-        # 3. Personal
-        wage_idx = (1 + fin_conf["wage_inc"]/100)**(t-1)
-        pers_cost = 0.0
-        hw_needs = {k: 0.0 for k in mapping}
+        # 2. Personal (Skalierung mit Umsatz)
+        wage_factor = (1 + fin_par["wage_inc"]/100)**(t-1)
+        lnk_factor = (1 + fin_par["lnk"]/100)
         
-        base_ftes = sum(safe_float(j.get("FTE Jahr 1")) for j in jobs)
-        target_fte = rev / fin_conf["target_rev_per_fte"] if fin_conf["target_rev_per_fte"] > 0 else 0
+        personnel_cost = 0.0
+        fte_count = 0.0
+        new_assets_needed = {"Laptop": 0, "Auto": 0}
         
-        curr_total_fte = 0
-        for j in jobs:
-            base = safe_float(j.get("FTE Jahr 1"))
-            sal = safe_float(j.get("Jahresgehalt (€)"))
-            # Skalierung FTE mit Umsatzwachstum (Modell 2 Logik)
-            fte = max(base, target_fte * (base/base_ftes)) if base_ftes > 0 else 0
-            curr_total_fte += fte
-            pers_cost += sal * fte * wage_idx * (1 + fin_conf["lnk_pct"]/100)
+        for s in staff:
+            # Dynamische FTE Berechnung: Basis + (Umsatz * Faktor)
+            fte_needed = s["FTE Jahr 1"] + (revenue * s["Steigerung/Umsatz"])
+            cost = fte_needed * s["Gehalt (€)"] * wage_factor * lnk_factor
+            personnel_cost += cost
+            fte_count += fte_needed
             
-            if j.get("Laptop"): hw_needs["Laptop"] += fte
-            if j.get("Smartphone"): hw_needs["Smartphone"] += fte
-            if j.get("Auto"): hw_needs["Auto"] += fte
-            if j.get("Büro"): hw_needs["Büro"] += fte
+            if s["Laptop"]: new_assets_needed["Laptop"] += fte_needed
+            if s["Auto"]: new_assets_needed["Auto"] += fte_needed
             
-        row["Personalkosten"] = pers_cost
-        row["FTE Total"] = curr_total_fte
-
-        # 4. Kostenstellen & OpEx
-        cc_sum = 0.0
+        row["Personal"] = personnel_cost
+        row["FTE"] = fte_count
+        
+        # 3. Sonstige Opex (Kostenstellen)
+        opex_fix = 0.0
+        opex_var = 0.0
+        infl_factor = (1 + fin_par["inflation"]/100)**(t-1)
+        
         for c in ccs:
-            nm = c.get("Kostenstelle"); base = safe_float(c.get("Grundwert Jahr 1 (€)")); coup = safe_float(c.get("Umsatz-Kopplung (%)"))/100
-            last = prev_cc.get(nm, base)
-            curr = base if t==1 else last * (1 + growth*coup)
-            # Inflation drauf
-            curr = curr * (1 + fin_conf["inflation"]/100)
-            prev_cc[nm] = curr; cc_sum += curr
+            opex_fix += c["Fix (€/Jahr)"] * infl_factor
+            opex_var += (c["Variabel (% v. Umsatz)"]/100) * revenue
+            
+        row["OpEx_Sonst"] = opex_fix + opex_var
         
-        # Akquisekosten (simuliert)
-        n_prev = N_curve[t_idx-1]
-        new_cust = max(0, n_t - (n_prev * 0.95)) # Simple approx for new customers
-        marketing_cac = new_cust * fin_conf["cac"]
-        
-        opex = pers_cost + cc_sum + marketing_cac
-        row["Gesamtkosten (OPEX)"] = opex
-        
-        # 5. Ergebnisse
-        ebitda = rev - cogs - opex
+        total_opex = personnel_cost + row["OpEx_Sonst"]
+        ebitda = revenue - cogs - total_opex
         row["EBITDA"] = ebitda
         
-        # Assets CAPEX & AFA
-        capex = 0.0; afa = 0.0
-        # Misc Capex
-        misc_p = asset_conf["capex_annual"]; misc_ul = asset_conf["depreciation_misc"]
-        asset_reg["Misc"].append({"y":t, "v":misc_p, "ul":misc_ul})
-        capex += misc_p
+        # --- C. ASSETS & AFA ---
+        # Asset Bedarf prüfen vs. Bestand
+        # Vereinfachung: Wir kaufen jedes Jahr neu für den Bestand (delta) und ersetzen alte
+        # Besser: Capex pauschal + Delta FTE
         
-        for k, (pk_key, ul_key) in mapping.items():
-            needed = hw_needs[k]
-            price = asset_conf[pk_key]; ul = asset_conf[ul_key]
-            have = sum(x["amt"] for x in asset_reg[k] if (t - x["y"]) < x["ul"])
-            buy = max(0, needed - have)
-            if buy > 0:
-                cost = buy * price; capex += cost
-                asset_reg[k].append({"y":t, "amt":buy, "v":cost, "ul":ul})
+        capex = asset_par["capex_misc"] # Laufendes Invest
         
-        for k in asset_reg:
-            for x in asset_reg[k]:
-                if 0 <= (t - x["y"]) < x["ul"]: afa += x["v"] / x["ul"]
+        # Einfache Asset Logik: Pro FTE ein Laptop/Auto wenn nötig
+        # Hier vereinfacht: Wir nehmen an, wir investieren ca. 2% vom Umsatz in Hardware + Fixum
+        capex_it = (fte_count * 200) + asset_par["capex_misc"]
         
-        row["Abschreibungen"] = afa
-        row["Investitionen (Assets)"] = capex
-        row["EBIT"] = ebitda - afa
+        # Zum Register hinzufügen
+        asset_registry.append({'val': capex_it, 'ul': asset_par["ul_misc"], 'age': 0})
         
-        # Zinsen & Steuern
-        intr = debt * (fin_conf["loan_rate"]/100)
-        ebt = row["EBIT"] - intr
+        # Abschreibung berechnen
+        afa = 0.0
+        new_registry = []
+        for asset in asset_registry:
+            if asset['age'] < asset['ul']:
+                rate = asset['val'] / asset['ul']
+                afa += rate
+                asset['age'] += 1
+                new_registry.append(asset)
+        asset_registry = new_registry
+        
+        row["AfA"] = afa
+        row["Capex"] = capex_it
+        
+        # --- D. ERGEBNIS ---
+        ebit = ebitda - afa
+        interest = debt * (fin_par["loan_rate"]/100)
+        ebt = ebit - interest
         
         tax = 0.0
-        if ebt < 0: loss_carry += abs(ebt)
+        if ebt < 0:
+            loss_carryforward += abs(ebt)
         else:
-            use = min(ebt, loss_carry); loss_carry -= use
-            tax = (ebt - use) * (fin_conf["tax_rate"]/100)
+            use_loss = min(ebt, loss_carryforward)
+            loss_carryforward -= use_loss
+            tax_base = ebt - use_loss
+            tax = tax_base * (fin_par["tax"]/100)
             
-        row["Steuern"] = tax
-        net = ebt - tax
-        row["Jahresüberschuss"] = net
+        net_income = ebt - tax
+        row["Jahresüberschuss"] = net_income
         
-        # Cashflow
-        cf_op = net + afa
-        cf_inv = -capex
+        # --- E. CASHFLOW & BILANZ ---
+        # Working Capital Change (vereinfacht)
+        # Forderungen steigen wenn Umsatz steigt
+        receivables = revenue * (fin_par["dso"]/360)
+        payables = (cogs + row["OpEx_Sonst"]) * (fin_par["dpo"]/360)
         
-        cash_start = results[-1]["Kasse"] if len(results) > 0 else fin_conf["equity"]
-        pre_fin = cash_start + cf_op + cf_inv
+        prev_nwc = rows[-1]["NWC"] if len(rows) > 0 else 0
+        curr_nwc = receivables - payables
+        delta_nwc = curr_nwc - prev_nwc
+        row["NWC"] = curr_nwc
         
-        min_c = fin_conf["min_cash"]
-        borrow = 0.0; repay = 0.0
-        if pre_fin < min_c: borrow = min_c - pre_fin
-        elif pre_fin > min_c and debt > 0: repay = min(debt, pre_fin - min_c)
+        cf_op = net_income + afa - delta_nwc
+        cf_inv = -capex_it
         
-        cash_end = pre_fin + borrow - repay
-        debt_end = debt + borrow - repay
+        cash_pre = cash + cf_op + cf_inv
         
-        row["Kasse"] = cash_end
-        row["Bankdarlehen"] = debt_end
-        row["Eigenkapital"] = fin_conf["equity"] + retained + net
+        borrow = 0.0
+        repay = 0.0
         
-        cash = cash_end; debt = debt_end
-        fixed_assets = max(0, fixed_assets + capex - afa)
-        retained += net
+        if cash_pre < fin_par["min_cash"]:
+            borrow = fin_par["min_cash"] - cash_pre
+        elif cash_pre > fin_par["min_cash"] and debt > 0:
+            repay = min(debt, cash_pre - fin_par["min_cash"])
+            
+        cash_final = cash_pre + borrow - repay
+        debt_final = debt + borrow - repay
         
-        results.append(row)
+        row["Kasse"] = cash_final
+        row["Schulden"] = debt_final
+        row["Cashflow"] = cf_op + cf_inv + borrow - repay
         
-    return pd.DataFrame(results)
+        # Bilanz Übergabe
+        cash = cash_final
+        debt = debt_final
+        fixed_assets_net = max(0, fixed_assets_net + capex_it - afa)
+        retained_earnings += net_income
+        
+        row["Eigenkapital"] = fin_par["equity"] + retained_earnings
+        row["Bilanzsumme"] = fixed_assets_net + cash_final + receivables
+        
+        rows.append(row)
+        
+    return pd.DataFrame(rows)
 
 # ==========================================
-# 3. PDF REPORT GENERATOR KLASSE
+# 2. LOGIK: SIMULATION ENGINE (Bass + Options)
 # ==========================================
-class DetailedReport(FPDF):
-    def __init__(self, scenario_name, case_type, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.scenario_name = scenario_name
-        self.case_type = case_type
+def run_simulation_logic(M, p, q, C, ARPU, kappa, Delta_CM, Fixed_Cost, start, T, 
+                   mode='static', trigger_val=0.05, fallback_params=None,
+                   switch_config=None):
     
+    # Initialisierung Arrays
+    N = np.zeros(T)
+    W = np.zeros(T)
+    ARPU_trace = np.zeros(T) # WICHTIG: Wir speichern den Preisverlauf für Modell 2
+    
+    N[0] = start
+    W[0] = -Fixed_Cost # T=0 Invest
+    ARPU_trace[0] = ARPU
+    
+    # Runtime Variablen
+    curr_p, curr_q, curr_C = p, q, C
+    curr_ARPU, curr_FC = ARPU, Fixed_Cost
+    curr_M = M
+    
+    option_exercised = False
+    project_dead = False
+    
+    growth_rates = []
+    
+    for t in range(1, T):
+        if project_dead:
+            N[t] = 0; W[t] = 0; ARPU_trace[t] = 0
+            continue
+            
+        N_prev = N[t-1]
+        
+        # 1. Bass Diffusion
+        # Potential = (p + q * (N/M)) * (M - N)
+        pot_new = (curr_p + curr_q * (N_prev/curr_M)) * (curr_M - N_prev)
+        if pot_new < 0: pot_new = 0
+        
+        rate = pot_new / curr_M # Share of Market Growth
+        
+        # 2. Option Trigger Check (ab Jahr 3)
+        if mode != 'static' and not option_exercised and t >= 3:
+            avg_growth = np.mean(growth_rates) if growth_rates else 0
+            
+            if avg_growth < trigger_val:
+                option_exercised = True
+                
+                if mode == 'abandon':
+                    project_dead = True
+                    N[t] = 0; W[t] = 0; ARPU_trace[t] = 0
+                    continue
+                    
+                elif mode == 'switch' and fallback_params:
+                    # Switch Logik: Wir fallen auf die "sichere" Strategie zurück
+                    # Aber: Das verursacht einen Schock (Preis hoch -> Kunden weg)
+                    
+                    # Parameter Swap
+                    curr_p = fallback_params['p']
+                    # Reputationsschaden auf q
+                    curr_q = fallback_params['q'] * switch_config.get('q_penalty', 0.8) 
+                    curr_C = fallback_params['C']
+                    curr_FC = fallback_params['Fixed_Cost']
+                    
+                    target_arpu = fallback_params['ARPU']
+                    
+                    # Preisschock berechnen
+                    price_increase = (target_arpu - curr_ARPU) / curr_ARPU if curr_ARPU > 0 else 0
+                    churn_shock = min(0.5, price_increase * switch_config.get('elasticity', 1.0))
+                    
+                    # Bestand reduzieren
+                    N_prev = N_prev * (1 - churn_shock)
+                    curr_ARPU = target_arpu
+                    
+                    # Neuberechnung Bass mit neuen Werten
+                    pot_new = (curr_p + curr_q * (N_prev/curr_M)) * (curr_M - N_prev)
+                    if pot_new < 0: pot_new = 0
+
+        growth_rates.append(rate)
+        
+        # 3. Bestandsberechnung
+        churned = N_prev * curr_C
+        N[t] = N_prev - churned + pot_new
+        if N[t] > curr_M: N[t] = curr_M
+        
+        # 4. Value Valuation (High Level für Simulation Ranking)
+        rev = N[t] * curr_ARPU
+        # Cannibalization Proxy
+        cannib = pot_new * kappa * Delta_CM
+        W[t] = rev - cannib - curr_FC
+        
+        ARPU_trace[t] = curr_ARPU
+        
+    return N, W, np.sum(W), ARPU_trace
+
+# ==========================================
+# 3. PDF GENERATOR
+# ==========================================
+class PDFReport(FPDF):
     def header(self):
-        self.set_font('Arial', 'B', 16)
-        self.set_text_color(44, 62, 80)
-        self.cell(0, 10, f'Simulation Report: {self.scenario_name}', 0, 1, 'L')
-        self.set_font('Arial', 'I', 10)
-        self.set_text_color(100, 100, 100)
-        self.cell(0, 6, f'Case: {self.case_type} | Generated: {datetime.datetime.now().strftime("%Y-%m-%d %H:%M")}', 0, 1, 'L')
-        self.line(10, 28, 200, 28)
-        self.ln(10)
-        
-    def chapter_title(self, label):
-        self.set_font('Arial', 'B', 12)
-        self.set_fill_color(230, 230, 230)
-        self.cell(0, 6, label, 0, 1, 'L', 1)
-        self.ln(4)
-
-    def add_plot(self, fig):
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmpfile:
-            fig.savefig(tmpfile.name, dpi=150, bbox_inches='tight')
-            self.image(tmpfile.name, w=180)
-        self.ln(5)
-        
-    def add_table(self, df):
-        self.set_font('Arial', 'B', 7)
-        cols = list(df.columns)
-        w = 190 / len(cols)
-        for col in cols:
-            self.cell(w, 5, str(col), 1, 0, 'C')
-        self.ln()
-        self.set_font('Arial', '', 7)
-        for _, row in df.iterrows():
-            for col in cols:
-                val = row[col]
-                txt = f"{val:,.0f}" if isinstance(val, (int, float)) else str(val)
-                self.cell(w, 5, txt, 1, 0, 'R')
-            self.ln()
+        self.set_font('Arial', 'B', 15)
+        self.cell(0, 10, 'Integriertes Strategie- & Finanz-Gutachten', 0, 1, 'C')
         self.ln(5)
 
-def generate_pdf_bytes(df_fin, scenario, case, N_series):
-    pdf = DetailedReport(scenario, case, orientation='P', unit='mm', format='A4')
-    pdf.alias_nb_pages()
-    
-    # Seite 1: Übersicht & Graphen
-    pdf.add_page()
-    pdf.chapter_title("Management Summary")
-    
-    # Key Metrics
-    last = df_fin.iloc[-1] if not df_fin.empty else None
-    if last is not None:
-        pdf.set_font("Arial", "", 10)
-        pdf.cell(0, 5, f"Jahr 10 Umsatz: {last['Umsatz']:,.0f} EUR", 0, 1)
-        pdf.cell(0, 5, f"Jahr 10 EBITDA: {last['EBITDA']:,.0f} EUR", 0, 1)
-        pdf.cell(0, 5, f"Kumulierter Cash: {last['Kasse']:,.0f} EUR", 0, 1)
-        pdf.ln(5)
+    def footer(self):
+        self.set_y(-15)
+        self.set_font('Arial', 'I', 8)
+        self.cell(0, 10, f'Seite {self.page_no()}', 0, 0, 'C')
 
-    # Graphen erstellen
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(6, 6))
-    ax1.plot(df_fin["Jahr"], df_fin["Umsatz"], label="Umsatz", color="blue")
-    ax1.plot(df_fin["Jahr"], df_fin["Gesamtkosten (OPEX)"], label="Opex", color="red", linestyle="--")
-    ax1.set_title("Umsatz & Kosten Entwicklung")
-    ax1.legend()
-    ax1.grid(True, alpha=0.3)
-    
-    ax2.bar(df_fin["Jahr"], df_fin["EBITDA"], color="green", alpha=0.6)
-    ax2.set_title("EBITDA")
-    ax2.grid(True, alpha=0.3)
-    
-    plt.tight_layout()
-    pdf.add_plot(fig)
-    plt.close(fig)
-    
-    # Seite 2: P&L Table
+def generate_detailed_pdf(scenario_name, case_name, df_fin, sim_plot_fig):
+    pdf = PDFReport()
     pdf.add_page()
-    pdf.chapter_title("Gewinn- und Verlustrechnung (GuV)")
-    cols_guv = ["Jahr", "Umsatz", "Wareneinsatz (COGS)", "Gesamtkosten (OPEX)", "EBITDA", "EBIT", "Jahresüberschuss"]
-    # Check if cols exist
-    use_cols = [c for c in cols_guv if c in df_fin.columns]
-    pdf.add_table(df_fin[use_cols].head(15)) # max 15 Jahre auf eine Seite
     
-    # Seite 3: Cashflow & Bilanz
-    pdf.add_page()
-    pdf.chapter_title("Cashflow & Bilanz Indikatoren")
-    cols_cf = ["Jahr", "Investitionen (Assets)", "Kreditaufnahme", "Tilgung", "Kasse", "Bankdarlehen", "Eigenkapital"]
-    use_cols_cf = [c for c in cols_cf if c in df_fin.columns]
-    pdf.add_table(df_fin[use_cols_cf].head(15))
+    # Title Info
+    pdf.set_font("Arial", "B", 12)
+    pdf.cell(0, 10, f"Strategie: {scenario_name}", 0, 1)
+    pdf.set_font("Arial", "", 10)
+    pdf.cell(0, 8, f"Szenario: {case_name} (Automatisch selektiert)", 0, 1)
+    pdf.cell(0, 8, f"Datum: {datetime.datetime.now().strftime('%d.%m.%Y')}", 0, 1)
+    pdf.ln(5)
     
-    return pdf.output(dest='S').encode('latin-1', 'replace')
+    # KPIs
+    last_row = df_fin.iloc[-1]
+    cum_cash = last_row['Kasse']
+    cum_profit = df_fin['Jahresüberschuss'].sum()
+    
+    pdf.set_fill_color(240, 240, 240)
+    pdf.cell(60, 10, f"Cash Jahr 10: {cum_cash:,.0f} EUR", 1, 0, 'C', 1)
+    pdf.cell(60, 10, f"Kum. Gewinn: {cum_profit:,.0f} EUR", 1, 1, 'C', 1)
+    pdf.ln(10)
+    
+    # Plot einfügen
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmpfile:
+        sim_plot_fig.savefig(tmpfile.name, dpi=100, bbox_inches="tight")
+        pdf.image(tmpfile.name, x=10, w=190)
+    pdf.ln(10)
+    
+    # Tabelle GuV (Auszug)
+    pdf.set_font("Arial", "B", 10)
+    pdf.cell(0, 10, "Detaillierte Finanzkennzahlen (Auszug)", 0, 1)
+    
+    cols = ["Jahr", "Umsatz", "EBITDA", "Jahresüberschuss", "Kasse"]
+    col_width = 35
+    
+    pdf.set_font("Arial", "B", 8)
+    for c in cols: pdf.cell(col_width, 6, c, 1, 0, 'C', 1)
+    pdf.ln()
+    
+    pdf.set_font("Arial", "", 8)
+    for _, row in df_fin.iterrows():
+        for c in cols:
+            val = row[c]
+            txt = f"{val:,.0f}" if isinstance(val, (int, float)) else str(val)
+            pdf.cell(col_width, 6, txt, 1, 0, 'R')
+        pdf.ln()
+        
+    return pdf.output(dest='S').encode('latin-1')
 
 # ==========================================
-# 4. GUI IMPLEMENTIERUNG
+# 4. UI: SEITENSTRUKTUR
 # ==========================================
-st.title("Integrated Valuation Model (Bass + Real Options + Financials)")
-st.markdown("Dieses Tool kombiniert eine stochastische Marktsimulation mit einem detaillierten Finanzplan.")
 
-tab_sim, tab_cost = st.tabs(["📊 Simulation & Strategie", "🏢 Kostenstruktur & Finanzplan"])
+st.title("💠 Integrated Real Options & Financial Factory")
+st.markdown("""
+Dieses Modell verbindet **Markt-Unsicherheit (Bass Diffusion)** mit **betriebswirtschaftlicher Realität (Finanzplan)**.
+1. Definiere die Kostenstruktur der Firma.
+2. Simuliere Marktszenarien (Standard vs. Fighter vs. Switch).
+3. Erzeuge detaillierte PDF-Reports für Worst/Base/Best Cases.
+""")
 
-# --- TAB 2: KOSTENSTRUKTUR (MODEL 2 INPUTS) ---
-with tab_cost:
-    st.markdown("### Detaillierte Kostenannahmen")
-    st.info("Diese Annahmen werden genutzt, um aus den Simulationsdaten (Kundenanzahl) einen detaillierten Finanzplan zu erstellen.")
-    
+tab_config, tab_sim, tab_results = st.tabs(["1. Firmen-Setup (Kosten)", "2. Markt-Simulation", "3. Reports & Export"])
+
+# --- TAB 1: KOSTEN SETUP ---
+with tab_config:
     c1, c2 = st.columns(2)
     with c1:
-        st.subheader("Finanzierung & Makro")
-        fp = st.session_state["fin_params"]
-        fp["equity"] = st.number_input("Eigenkapital (€)", value=fp["equity"], step=5000.0)
-        fp["loan_rate"] = st.number_input("Kreditzins %", value=fp["loan_rate"], step=0.1)
-        fp["tax_rate"] = st.number_input("Steuersatz %", value=fp["tax_rate"], step=1.0)
-        fp["wage_inc"] = st.number_input("Lohnsteigerung p.a. %", value=fp["wage_inc"], step=0.1)
-        fp["cac"] = st.number_input("Marketing CAC (€)", value=fp["cac"], step=10.0)
+        st.subheader("Personal & Struktur")
+        st.session_state["staff_df"] = st.data_editor(st.session_state["staff_df"], num_rows="dynamic")
+        
+        # Fixkosten Berechnung für Simulation
+        staff_fix = st.session_state["staff_df"]["Gehalt (€)"].sum() * (1 + st.session_state["params_fin"]["lnk"]/100)
         
     with c2:
-        st.subheader("Asset Preise")
-        ap = st.session_state["assets_params"]
-        c2a, c2b = st.columns(2)
-        with c2a:
-            ap["price_laptop"] = st.number_input("Preis Laptop", value=ap["price_laptop"])
-            ap["price_car"] = st.number_input("Preis PKW", value=ap["price_car"])
-        with c2b:
-            ap["capex_annual"] = st.number_input("Sonst. Capex p.a.", value=ap["capex_annual"])
-            
-    st.markdown("---")
-    st.subheader("Personalplan (Initial)")
-    st.session_state["current_jobs_df"] = st.data_editor(st.session_state["current_jobs_df"], num_rows="dynamic", use_container_width=True)
+        st.subheader("Kostenstellen (OpEx)")
+        st.session_state["cost_df"] = st.data_editor(st.session_state["cost_df"], num_rows="dynamic")
+        
+        cc_fix = st.session_state["cost_df"]["Fix (€/Jahr)"].sum()
     
-    st.subheader("Kostenstellen (Fix & Variabel)")
-    st.session_state["cost_centers_df"] = st.data_editor(st.session_state["cost_centers_df"], num_rows="dynamic", use_container_width=True)
+    st.divider()
+    
+    fc_1, fc_2, fc_3 = st.columns(3)
+    with fc_1:
+        st.subheader("Finanzierung")
+        p = st.session_state["params_fin"]
+        p["equity"] = st.number_input("Eigenkapital", value=p["equity"])
+        p["tax"] = st.number_input("Steuersatz %", value=p["tax"])
+        
+    with fc_2:
+        st.subheader("Assets")
+        a = st.session_state["params_asset"]
+        a["capex_misc"] = st.number_input("Jährliches Capex Budget", value=a["capex_misc"])
+        
+    # Total Fixkosten Proxy berechnen
+    total_fix_proxy = staff_fix + cc_fix + a["capex_misc"]
+    with fc_3:
+        st.info(f"ℹ️ Berechnete Basis-Fixkosten für Simulation:\n\n**{total_fix_proxy:,.0f} € / Jahr**\n\n(Wird automatisch in Tab 2 übernommen)")
 
-    # Berechne Basis-Fixkosten für die Simulation (Proxy)
-    # Summe Gehälter + Fixe Kostenstellen + Capex Abschreibung approx
-    jobs_sum = st.session_state["current_jobs_df"]["Jahresgehalt (€)"].sum() * 1.25 # inkl NK
-    cc_sum = st.session_state["cost_centers_df"]["Grundwert Jahr 1 (€)"].sum()
-    estimated_fixed_costs = jobs_sum + cc_sum + ap["capex_annual"]
-
-# --- TAB 1: SIMULATION ---
+# --- TAB 2: SIMULATION ---
 with tab_sim:
-    # Sidebar History
-    with st.sidebar:
-        st.header("Simulation Settings")
-        T_in = st.slider("Laufzeit (Jahre)", 5, 20, 10)
-        M_in = st.number_input("Marktpotenzial (M)", value=50000, step=1000)
+    s1, s2 = st.columns([1, 3])
+    with s1:
+        st.header("Parameter")
+        T_sim = st.slider("Laufzeit (Jahre)", 5, 20, 10)
+        M_sim = st.number_input("Marktpotenzial", 10000, 1000000, 50000)
         
-        st.markdown("---")
-        st.markdown("**Trigger Settings**")
-        trig_val_in = st.slider("Wachstumsgrenze (<)", 0.0, 0.2, 0.05, 0.01)
-        check_year_in = st.number_input("Prüfung ab Jahr", 1, T_in, 3)
+        st.markdown("### Real Option Trigger")
+        trig_growth = st.slider("Wachstumsgrenze (<%)", 0.0, 0.2, 0.05)
+        st.caption("Wenn durchschnittliches Wachstum unter X% fällt, wird gewechselt/abgebrochen.")
         
-        st.markdown("---")
-        st.caption(f"Geschätzte Fixkosten (aus Tab 2): {estimated_fixed_costs:,.0f} €")
+    with s2:
+        st.markdown("#### Szenarien Konfiguration")
         
-    # Input Ranges für Simulation
-    col_left, col_right = st.columns(2)
-    
-    def range_in(label, def_min, def_max, key_suffix, step=0.01):
-        c1, c2 = st.columns(2)
-        v_min = c1.number_input(f"{label} Min", value=float(def_min), step=step, key=f"{label}_min_{key_suffix}")
-        v_max = c2.number_input(f"{label} Max", value=float(def_max), step=step, key=f"{label}_max_{key_suffix}")
-        return (v_min, v_max)
-
-    with col_left:
-        st.markdown("### Option A: Standard (Safe)")
-        p_a = range_in("p", 0.005, 0.010, "a", 0.001)
-        q_a = range_in("q", 0.15, 0.25, "a", 0.01)
-        c_a = range_in("Churn", 0.03, 0.05, "a", 0.01)
-        arpu_a = range_in("ARPU", 1800, 2200, "a", 50.0)
-        # Fixkosten nehmen wir global aus Tab 2, aber Kappa/Delta_CM sind strategiesspezifisch
-        kap_a = range_in("Kappa", 0.05, 0.10, "a", 0.01)
-        dcm_a = range_in("Delta Margin", 50, 100, "a", 10.0)
-
-    with col_right:
-        st.markdown("### Option B: Fighter (Aggressiv)")
-        p_b = range_in("p", 0.030, 0.050, "b", 0.001)
-        q_b = range_in("q", 0.25, 0.40, "b", 0.01)
-        c_b = range_in("Churn", 0.08, 0.12, "b", 0.01)
-        arpu_b = range_in("ARPU", 1200, 1500, "b", 50.0)
-        kap_b = range_in("Kappa", 0.15, 0.25, "b", 0.01)
-        dcm_b = range_in("Delta Margin", 50, 100, "b", 10.0)
-
-    with st.expander("⚙️ Switch Konfiguration"):
-        # Switch Matrix Inputs (Hardcoded defaults for brevity, can be expanded)
-        switch_config_dict = {
-            'grandfathering': False, 'thresh_low': 0.10, 'thresh_high': 0.20,
-            'shock_zone1_nogf': 0.05, 'q_mult_zone1_nogf': 0.9,
-            'shock_zone2_nogf': 0.15, 'q_mult_zone2_nogf': 0.7,
-            'shock_zone3_nogf': 0.30, 'q_mult_zone3_nogf': 0.5,
-            # Placeholder for GF
-            'shock_zone1_gf': 0.0, 'q_mult_zone1_gf': 0.95,
-            'shock_zone2_gf': 0.0, 'q_mult_zone2_gf': 0.8,
-            'shock_zone3_gf': 0.0, 'q_mult_zone3_gf': 0.6,
-        }
-        st.write("Verwendet Standard-Matrix Parameter für Preisschocks.")
-
-    if st.button("🚀 Simulation Starten", type="primary", use_container_width=True):
+        def range_input(label, default_min, default_max, key):
+            c_a, c_b = st.columns(2)
+            rmin = c_a.number_input(f"{label} Min", value=default_min, key=f"{key}_min")
+            rmax = c_b.number_input(f"{label} Max", value=default_max, key=f"{key}_max")
+            return (rmin, rmax)
         
-        # 1. Parameter Zusammenbau
-        params_A = {'M': (M_in, M_in), 'p': p_a, 'q': q_a, 'C': c_a, 'ARPU': arpu_a, 'kappa': kap_a, 'Delta_CM': dcm_a, 'Fixed_Cost': (estimated_fixed_costs, estimated_fixed_costs)}
-        params_B = {'M': (M_in, M_in), 'p': p_b, 'q': q_b, 'C': c_b, 'ARPU': arpu_b, 'kappa': kap_b, 'Delta_CM': dcm_b, 'Fixed_Cost': (estimated_fixed_costs, estimated_fixed_costs)}
+        st.subheader("Option A: Standard (Hoher Preis, langsames Wachstum)")
+        p_a = range_input("Innovation (p)", 0.005, 0.010, "pa")
+        q_a = range_input("Imitation (q)", 0.15, 0.25, "qa")
+        arpu_a = range_input("ARPU (€)", 2000.0, 2200.0, "arpua")
         
-        scenarios = [
-            ("Standard (A)", params_A, 'static', None),
-            ("Fighter (B)", params_B, 'static', None),
-            ("Switch Option", params_B, 'switch', params_A),
-            ("Abandon Option", params_B, 'abandon', None)
-        ]
+        st.divider()
         
-        sim_store = {}
-        iterations = 500 # Für Performance im Demo-Mode
+        st.subheader("Option B: Fighter (Niedriger Preis, aggressiv)")
+        p_b = range_input("Innovation (p)", 0.020, 0.040, "pb")
+        q_b = range_input("Imitation (q)", 0.30, 0.45, "qb")
+        arpu_b = range_input("ARPU (€)", 1200.0, 1400.0, "arpub")
         
-        progress_bar = st.progress(0)
+        # Fixkosten nehmen wir global
+        fc_sim = (total_fix_proxy, total_fix_proxy)
         
-        def get_rnd(v): return np.random.triangular(v[0], (v[0]+v[1])/2, v[1]) if isinstance(v, tuple) else v
-
-        # 2. Monte Carlo Loop
-        for idx, (name, p_rng, mode, fb_rng) in enumerate(scenarios):
+    if st.button("🚀 Monte Carlo Simulation Starten", type="primary", use_container_width=True):
+        with st.spinner("Simuliere 1.000 Pfade pro Strategie..."):
             
-            runs_N = []
-            runs_W = []
-            runs_ARPU = []
-            final_sums = []
+            # Switch Config
+            sw_conf = {'q_penalty': 0.8, 'elasticity': 1.5}
             
-            for _ in range(iterations):
-                curr = {k: get_rnd(v) for k, v in p_rng.items()}
-                fb = {k: get_rnd(v) for k, v in fb_rng.items()} if fb_rng else None
-                
-                N_t, W_t, sum_w, _, arpu_t = run_simulation(
-                    **curr, start=10, T=T_in, mode=mode, trigger_val=trig_val_in,
-                    fallback_params=fb, check_year=check_year_in, switch_config=switch_config_dict
-                )
-                
-                runs_N.append(N_t)
-                runs_W.append(W_t)
-                runs_ARPU.append(arpu_t)
-                final_sums.append(sum_w)
-            
-            # 3. Statistiken extrahieren
-            arr_N = np.array(runs_N)
-            arr_ARPU = np.array(runs_ARPU)
-            
-            # Wir identifizieren Worst (P5), Base (Mean-nähest), Best (P95) basierend auf dem Total Value
-            sums = np.array(final_sums)
-            idx_worst = np.argsort(sums)[int(iterations * 0.05)]
-            idx_best = np.argsort(sums)[int(iterations * 0.95)]
-            # Für Base nehmen wir den Median Index
-            idx_base = np.argsort(sums)[int(iterations * 0.50)]
-            
-            sim_store[name] = {
-                "mean_val": np.mean(sums),
-                "std_val": np.std(sums),
-                "N_worst": arr_N[idx_worst], "ARPU_worst": arr_ARPU[idx_worst],
-                "N_base": arr_N[idx_base], "ARPU_base": arr_ARPU[idx_base],
-                "N_best": arr_N[idx_best], "ARPU_best": arr_ARPU[idx_best],
-                "all_N": arr_N
+            # Parameter Packs
+            # Fallback Params (Standard) für Switch Option
+            fb_params = {
+                'p': (p_a[0]+p_a[1])/2, 
+                'q': (q_a[0]+q_a[1])/2, 
+                'C': 0.05, 
+                'ARPU': (arpu_a[0]+arpu_a[1])/2, 
+                'Fixed_Cost': total_fix_proxy
             }
-            progress_bar.progress((idx + 1) / 4)
             
-        st.session_state.sim_results = sim_store
-        st.success("Simulation abgeschlossen!")
+            strategies = [
+                ("1. Standard", {'p':p_a, 'q':q_a, 'ARPU':arpu_a}, 'static', None),
+                ("2. Fighter", {'p':p_b, 'q':q_b, 'ARPU':arpu_b}, 'static', None),
+                ("3. Switch Option", {'p':p_b, 'q':q_b, 'ARPU':arpu_b}, 'switch', fb_params),
+                ("4. Abandon Option", {'p':p_b, 'q':q_b, 'ARPU':arpu_b}, 'abandon', None),
+            ]
+            
+            results = {}
+            ITERATIONS = 500
+            
+            for name, rng, mode, fb in strategies:
+                sim_n = []; sim_arpu = []; sim_w = []
+                
+                for i in range(ITERATIONS):
+                    # Randomize Inputs
+                    curr_p = np.random.uniform(rng['p'][0], rng['p'][1])
+                    curr_q = np.random.uniform(rng['q'][0], rng['q'][1])
+                    curr_arpu = np.random.uniform(rng['ARPU'][0], rng['ARPU'][1])
+                    curr_c = np.random.uniform(0.05, 0.08) # Churn Range
+                    
+                    # Run Logic
+                    N_trace, W_trace, W_sum, ARPU_trace = run_simulation_logic(
+                        M=M_sim, p=curr_p, q=curr_q, C=curr_c, ARPU=curr_arpu, 
+                        kappa=0.1, Delta_CM=100, Fixed_Cost=total_fix_proxy, 
+                        start=50, T=T_sim, mode=mode, trigger_val=trig_growth, 
+                        fallback_params=fb, switch_config=sw_conf
+                    )
+                    
+                    sim_n.append(N_trace)
+                    sim_arpu.append(ARPU_trace)
+                    sim_w.append(W_sum)
+                
+                # Identify Cases (Best/Base/Worst by NPV)
+                arr_w = np.array(sim_w)
+                idx_sort = np.argsort(arr_w)
+                
+                idx_worst = idx_sort[int(ITERATIONS * 0.05)]
+                idx_base = idx_sort[int(ITERATIONS * 0.50)]
+                idx_best = idx_sort[int(ITERATIONS * 0.95)]
+                
+                results[name] = {
+                    "mean_npv": np.mean(arr_w),
+                    "std_npv": np.std(arr_w),
+                    "all_n": np.array(sim_n),
+                    "cases": {
+                        "Worst Case": {"N": sim_n[idx_worst], "ARPU": sim_arpu[idx_worst]},
+                        "Base Case": {"N": sim_n[idx_base], "ARPU": sim_arpu[idx_base]},
+                        "Best Case": {"N": sim_n[idx_best], "ARPU": sim_arpu[idx_best]},
+                    }
+                }
+            
+            st.session_state.sim_results = results
+            st.success("Simulation berechnet. Gehe zu Tab 3 für Ergebnisse.")
 
-    # --- ERGEBNIS ANZEIGE ---
-    if st.session_state.sim_results:
+# --- TAB 3: ERGEBNISSE & REPORTING ---
+with tab_results:
+    if st.session_state.sim_results is None:
+        st.warning("Bitte zuerst Simulation in Tab 2 starten.")
+    else:
         res = st.session_state.sim_results
         
-        st.markdown("### Simulations-Ergebnisse (High Level)")
-        
-        # Übersichtstabelle
-        summ = []
-        for k, v in res.items():
-            summ.append({"Szenario": k, "Ø Net Value (Proxy)": f"{v['mean_val']:,.0f}", "Risk (Std)": f"{v['std_val']:,.0f}"})
-        st.dataframe(pd.DataFrame(summ))
-        
-        # Plot
-        fig, ax = plt.subplots(figsize=(10, 4))
-        for k, v in res.items():
-            # Zeige Base Case Kurve
-            ax.plot(v["N_base"], label=k)
-            # Unsicherheitsbereich (statistisch berechnet aus allen Runs)
-            p5 = np.percentile(v["all_N"], 5, axis=0)
-            p95 = np.percentile(v["all_N"], 95, axis=0)
-            ax.fill_between(range(len(p5)), p5, p95, alpha=0.1)
-        ax.set_title("Kundenentwicklung (Base Case + Uncertainty)")
-        ax.legend()
-        st.pyplot(fig)
-        
-        st.markdown("---")
-        st.markdown("### 📥 Detaillierte Finanzberichte generieren")
-        st.info("Wähle ein Szenario und lade den PDF Report herunter. Der Report nutzt die Kostendaten aus dem 'Kostenstruktur'-Tab.")
-        
-        cols = st.columns(4)
+        # 1. Übersicht
+        st.markdown("### Strategie-Vergleich")
+        cols = st.columns(len(res))
         for i, (name, data) in enumerate(res.items()):
-            with cols[i]:
-                st.markdown(f"**{name}**")
+            cols[i].metric(name, f"{data['mean_npv']/1e6:.2f} Mio €", f"Risk: {data['std_npv']/1e6:.2f} Mio")
+            
+        # 2. Detail Analyse mit PDF Engine
+        st.divider()
+        st.subheader("Detaillierter Finanzplan Generator")
+        
+        sel_strat = st.selectbox("Wähle Strategie:", list(res.keys()))
+        
+        # Hole Daten für gewählte Strategie
+        strat_data = res[sel_strat]
+        cases = strat_data["cases"]
+        
+        c1, c2, c3 = st.columns(3)
+        
+        # Helper zum Plotten und Rechnen
+        def process_case(case_label, col_container):
+            with col_container:
+                st.markdown(f"**{case_label}**")
+                N_curve = cases[case_label]["N"]
+                ARPU_curve = cases[case_label]["ARPU"]
                 
-                # WORST CASE BUTTON
-                if st.button(f"Worst Case PDF", key=f"btn_w_{i}"):
-                    df_fin = calculate_detailed_financials(T_in, data["N_worst"], data["ARPU_worst"], 
-                                                         st.session_state["current_jobs_df"], 
-                                                         st.session_state["cost_centers_df"], 
-                                                         st.session_state["assets_params"], 
-                                                         st.session_state["fin_params"])
-                    pdf_data = generate_pdf_bytes(df_fin, name, "Worst Case (P5)", data["N_worst"])
-                    st.download_button("⬇️ Download", pdf_data, f"{name}_Worst.pdf", "application/pdf", key=f"dl_w_{i}")
+                # FINANZPLAN BERECHNEN
+                df_fin = calculate_financial_plan(
+                    len(N_curve), N_curve, ARPU_curve,
+                    st.session_state["staff_df"],
+                    st.session_state["cost_df"],
+                    st.session_state["params_fin"],
+                    st.session_state["params_asset"]
+                )
+                
+                # Mini Stats
+                rev_sum = df_fin["Umsatz"].sum()
+                ebitda_sum = df_fin["EBITDA"].sum()
+                st.caption(f"Ø Umsatz: {rev_sum/len(df_fin):,.0f}")
+                st.caption(f"Ø EBITDA: {ebitda_sum/len(df_fin):,.0f}")
+                
+                # Plot erstellen (für Streamlit UND PDF)
+                fig, ax = plt.subplots(figsize=(4, 3))
+                ax.plot(df_fin["Jahr"], df_fin["Umsatz"], label="Umsatz", color="blue")
+                ax.plot(df_fin["Jahr"], df_fin["OpEx_Sonst"]+df_fin["Personal"], label="Kosten", color="red", ls="--")
+                ax.fill_between(df_fin["Jahr"], 0, df_fin["EBITDA"], color="green", alpha=0.3, label="EBITDA")
+                ax.set_title(f"{case_label}")
+                ax.legend(fontsize='x-small')
+                st.pyplot(fig)
+                
+                # PDF Button
+                pdf_bytes = generate_detailed_pdf(sel_strat, case_label, df_fin, fig)
+                st.download_button(
+                    f"📄 Report {case_label}", 
+                    pdf_bytes, 
+                    f"{sel_strat}_{case_label}.pdf", 
+                    "application/pdf",
+                    key=f"btn_{sel_strat}_{case_label}"
+                )
+                plt.close(fig)
 
-                # BASE CASE BUTTON
-                if st.button(f"Base Case PDF", key=f"btn_b_{i}"):
-                    df_fin = calculate_detailed_financials(T_in, data["N_base"], data["ARPU_base"], 
-                                                         st.session_state["current_jobs_df"], 
-                                                         st.session_state["cost_centers_df"], 
-                                                         st.session_state["assets_params"], 
-                                                         st.session_state["fin_params"])
-                    pdf_data = generate_pdf_bytes(df_fin, name, "Base Case (Median)", data["N_base"])
-                    st.download_button("⬇️ Download", pdf_data, f"{name}_Base.pdf", "application/pdf", key=f"dl_b_{i}")
-
-                # BEST CASE BUTTON
-                if st.button(f"Best Case PDF", key=f"btn_best_{i}"):
-                    df_fin = calculate_detailed_financials(T_in, data["N_best"], data["ARPU_best"], 
-                                                         st.session_state["current_jobs_df"], 
-                                                         st.session_state["cost_centers_df"], 
-                                                         st.session_state["assets_params"], 
-                                                         st.session_state["fin_params"])
-                    pdf_data = generate_pdf_bytes(df_fin, name, "Best Case (P95)", data["N_best"])
-                    st.download_button("⬇️ Download", pdf_data, f"{name}_Best.pdf", "application/pdf", key=f"dl_best_{i}")
+        process_case("Worst Case", c1)
+        process_case("Base Case", c2)
+        process_case("Best Case", c3)
+        
+        st.divider()
+        with st.expander("🔍 Blick in die Rohdaten (Base Case)"):
+             N_base = cases["Base Case"]["N"]
+             ARPU_base = cases["Base Case"]["ARPU"]
+             df_debug = calculate_financial_plan(
+                    len(N_base), N_base, ARPU_base,
+                    st.session_state["staff_df"],
+                    st.session_state["cost_df"],
+                    st.session_state["params_fin"],
+                    st.session_state["params_asset"]
+             )
+             st.dataframe(df_debug.style.format("{:,.0f}"))
